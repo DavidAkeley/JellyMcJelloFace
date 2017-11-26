@@ -1,0 +1,1068 @@
+<!-- Web client for Jelly McJelloFace   David Akeley 2017 -->
+<html>
+<head>
+<title>Jelly McJelloFace - David Akeley 2017</title>
+<script type="text/javascript" src="libjellymjf-wasm.js"></script> <!-- Oh, my. -->
+<script type="text/javascript" src="tinywebgl-ucla.js"></script>
+<script type="text/javascript">
+
+/*    Web client for Jelly McJelloFace - David Akeley 2017
+ *    
+ *  The game simulates a 1x1x1 jello cube with beads embedded inside of  it.
+ *  The  beads  are  unartistically  arranged in the shape of a face and the
+ *  cube  is  drawn  against  a  skybox  background,  with  that  background
+ *  reflecting  and  refracting  off the cube. The player interacts with the
+ *  cube by delivering jolts and using a laser to melt down the cube.
+ *  
+ *  This file implements the client of the Jelly McJelloFace  program.  It's
+ *  split  up  into six logical portions. Part 1 implements the hierarchical
+ *  code for arranging beads in the shape  of  a  face.  Part  2  implements
+ *  various  utility  functions  for  things like compiling shaders, loading
+ *  cubemap textures, converting matrix  objects  to  16-float  arrays,  and
+ *  panic.  Parts  3  - 5 implement functions for drawing the objects in the
+ *  program: the beads, the  skybox,  and  the  distorting,  reflective  and
+ *  refractive jello cube. Each object has its data encapsulated in a single
+ *  OpenGL vertex array object (vao) that  is  initialized  only  once,  the
+ *  first  time the object is drawn. Part 6 implements the controls and main
+ *  loop, which configures OpenGL, coordinates calling  the  object  drawing
+ *  functions, and updates the FPS (drawn onto a separate non-WebGL canvas).
+ */
+
+var screen_x, screen_y;
+
+const fovy_radians = 1.0;
+const near_plane = 0.01;
+const far_plane = 40.0;
+var canvas;
+var fps_canvas;
+var fps_canvas_context;
+var view;
+var projection;
+var eye;
+
+var laser_direction = Vec.of(1, 0, 0, 0);
+const laser_heat_per_second = 60.0;
+const laser_beam_radius = 0.4;
+var laser_on = false;
+var beads_drawn = true;
+var bead_debug = false;
+
+/*  Part 1: generate a list of beads that resemble  a  face  as  a  list  of
+ *  2-tuples  of  3-tuples:  [[x,  y, z], [red, green, blue]]. In these face
+ *  functions, color is always a 3-tuple (r, g, b).
+ */
+function generate_face_bead_list() {
+    var result = [];
+    
+    const head_xz_radius = 0.25;
+    var M_head = Mat4.translation(Vec.of(0.5, 0.42, 0.375));
+    var skin_color = Vec.of(0.7, 0.7, 0.5);
+    
+    // Draw the ellipsoid head and hair extending in the +z direction.
+    for (var i = -10; i <= 10; ++i) {
+        const y = i * 0.03;
+        const r = head_xz_radius * 3.1623 * Math.sqrt(0.1 - y*y);
+        var M_loop = M_head.times(Mat4.translation(Vec.of(0, y, 0)));
+        M_loop.post_multiply(Mat4.scale(Vec.of(r, r, r)));
+        add_bead_loop(result, M_loop, skin_color, 48);
+        
+        if (i < -6) continue; // Don't add hair below this level.
+        
+        for (var angle = -1.25; angle <= 1.25; angle += 0.25) {
+            const loop_coordinate = Vec.of(Math.sin(angle), 0, Math.cos(angle), 1);
+            var M_hair = Mat4.translation(M_loop.times(loop_coordinate));
+            M_hair.post_multiply(Mat4.rotation(angle, Vec.of(0, 1, 0)));
+            M_hair.post_multiply(Mat4.rotation(1.7 - i*0.1, Vec.of(1, 0, 0)));
+            
+            const gray = 0.2 + 0.2*Math.random();
+            const hair_color = Vec.of(gray, gray, gray);
+            const tip_color = Vec.of(0.9, 0.9, 0.9 - 0.3*Math.random());
+            
+            add_hair(result, M_hair, hair_color, tip_color);
+        }
+    }
+    
+    // Draw the two ears.
+    var M_ear1 = M_head.times(Mat4.translation(Vec.of(head_xz_radius, 0, 0)));
+    add_ear(result, M_ear1, skin_color, Vec.of(0.1, 0.8, 0.1));
+    var M_ear2 = M_head.times(Mat4.translation(Vec.of(-head_xz_radius, 0, 0)));
+    M_ear2.post_multiply(Mat4.scale(Vec.of(-1, 1, 1)));
+    add_ear(result, M_ear2, skin_color, Vec.of(0.8, 0.1, 0.1));
+    
+    // Draw the two eyes. Position them by moving them to the front of the
+    // head (-z) and then rotation to position them to the two sides.
+    const eye_color = Vec.of(0.2, 0.4+Math.random()*0.3, Math.random());
+    var M_eye1 = M_head.times(Mat4.rotation(0.3, Vec.of(0, 1, 0)));
+    M_eye1.post_multiply(Mat4.translation(Vec.of(0, 0, -head_xz_radius-0.01)));
+    add_eye(result, M_eye1, eye_color);
+    var M_eye2 = M_head.times(Mat4.rotation(-0.3, Vec.of(0, 1, 0)));
+    M_eye2.post_multiply(Mat4.translation(Vec.of(0, 0, -head_xz_radius-0.01)));
+    add_eye(result, M_eye2, eye_color);
+    
+    // Add a mouth. This is still hard-coded due to continuing laziness.
+    for (var f = -3.0; f <= 3.0; f += 0.5) {
+        const coordinate = Vec.of(f * 0.04,
+                                  0.02*Math.sin(f - 0.7) - 0.13,
+                                  -0.24,
+                                  1);
+        result.push([M_head.times(coordinate), Vec.of(1, 0, 1)]);
+        // Offensive colored lips.
+    }
+    
+    return result;
+}
+
+/*  Append a list of [bead_count] beads to the  list  of  beads  (using  the
+ *  specified  color). The list of beads forms a circle with radius 1 in the
+ *  xz plane before being transformed by the matrix M.
+ */
+function add_bead_loop(list, M, color, bead_count) {
+    const pi_portion = 2 * Math.PI / bead_count;
+    for (var i = 0; i < bead_count; ++i) {
+        const z_wt = Math.sin(pi_portion * i);
+        const x_wt = Math.cos(pi_portion * i);
+        list.push([M.times(Vec.of(x_wt, 0, z_wt, 1)), color]);    }
+}
+
+/*  Add a hair by starting a random walk at the origin of the  M  coordinate
+ *  system. The random walk moves along the x, z, and positive y axis of the
+ *  M system, leaving a bead at each step. We also add a dyed tip.
+ */
+function add_hair(list, M, hair_color, tip_color) {
+    var position = Vec.of(0, 0, 0, 1);
+    for (var i = 0; i < 16; ++i) {
+        position = hair_random_walk_step(position);
+        list.push([M.times(position), hair_color]);
+    }
+    // Define a new coordinate system for the dyed tip.
+    var M_tip = M.times(Mat4.translation(position));
+    position = Vec.of(0, 0, 0, 1);
+    for (var i = 0; i < 6; ++i) {
+        position = hair_random_walk_step(position);
+        list.push([M_tip.times(position), tip_color]);
+    }
+}
+
+function hair_random_walk_step(p) {
+    const step = 0.02;
+    switch ((8 * Math.random()) | 0) {
+        default: return Vec.of(p[0], p[1]+step, p[2], 1);
+        case 0:  return Vec.of(p[0]+step, p[1], p[2], 1);
+        case 1:  return Vec.of(p[0]-step, p[1], p[2], 1);
+        case 2:  return Vec.of(p[0], p[1], p[2]+step, 1);
+        case 3:  return Vec.of(p[0], p[1], p[2]-step, 1);
+    }
+}
+
+/*  Add an ear at the origin of the M system. The ear will extend in the  +x
+ *  direction only. An earring is included as a child object.
+ */
+function add_ear(list, M, ear_color, earring_color) {
+    const x_radius = 0.07;
+    const y_radius = 0.1;
+    
+    // Center of the ear is offset from M's origin so that it's in +x only.
+    var M_ear = M.times(Mat4.translation(Vec.of(x_radius, 0, 0)));
+    
+    // Two loops representing the ear are ellipsoids in xy plane.
+    var M_ear_loop = M_ear.times(Mat4.rotation(Math.PI/2, Vec.of(1, 0, 0)));
+    M_ear_loop.post_multiply(Mat4.scale(Vec.of(x_radius, 0, y_radius)));
+    add_bead_loop(list, M_ear_loop, ear_color, 32);
+    M_ear_loop.post_multiply(Mat4.scale(Vec.of(0.5, 0, 0.5)));
+    add_bead_loop(list, M_ear_loop, ear_color, 16);
+    
+    // Earring is in yz plane instead.
+    var M_earring = M_ear.times(Mat4.translation(Vec.of(0, -y_radius, 0)));
+    M_earring.post_multiply(Mat4.rotation(Math.PI/2, Vec.of(0, 0, 1)));
+    M_earring.post_multiply(Mat4.scale(Vec.of(y_radius/4, 0, y_radius/4)));
+    add_bead_loop(list, M_earring, earring_color, 8);
+}
+
+/*  Draw an eye that's a disk  in  the  xy  plane  of  M  (centered  at  M's
+ *  origin).
+ */
+function add_eye(list, M, eye_color) {
+    var M_eye = M.times(Mat4.rotation(Math.PI/2, Vec.of(1, 0, 0)));
+    
+    const M5 = M_eye.times(Mat4.scale(Vec.of(0.05, 0, 0.05)));
+    const M4 = M_eye.times(Mat4.scale(Vec.of(0.04, 0, 0.04)));
+    const M3 = M_eye.times(Mat4.scale(Vec.of(0.03, 0, 0.03)));
+    const M2 = M_eye.times(Mat4.scale(Vec.of(0.02, 0, 0.02)));
+    const M1 = M_eye.times(Mat4.scale(Vec.of(0.01, 0, 0.01)));
+    
+    add_bead_loop(list, M1, Vec.of(0, 0, 0), 4);
+    add_bead_loop(list, M2, Vec.of(0, 0, 0), 8);
+    add_bead_loop(list, M3, eye_color, 12);
+    add_bead_loop(list, M4, Vec.of(1, 1, 1), 16);
+    add_bead_loop(list, M5, Vec.of(1, 1, 1), 20);
+}
+
+/*  Part 2: Boring utility functions.
+ */
+
+// Convert Garett's Matrix to column-major array suitable for uniformMatrix4fv.
+function _1D(M) {
+    var result = new Float32Array(16);
+    for (var i = 0; i < 16; ++i) result[i] = M[i&3][i>>2];
+    return result;
+}
+
+function panic(message) {
+    alert(message);
+    throw message;
+}
+
+function make_program(gl, vs_code, fs_code) {
+    program_id = gl.createProgram();
+    vs_id = gl.createShader(gl.VERTEX_SHADER);
+    fs_id = gl.createShader(gl.FRAGMENT_SHADER);
+    
+    gl.shaderSource(vs_id, vs_code);
+    gl.shaderSource(fs_id, fs_code);
+    
+    gl.compileShader(vs_id);
+    gl.compileShader(fs_id);
+    
+    for (var id of [vs_id, fs_id]) {
+        if (!gl.getShaderParameter(id, gl.COMPILE_STATUS)) {
+            const src = id == vs_id ? vs_code : fs_code;
+            panic("shader error:\n" + gl.getShaderInfoLog(id) + "\n" + src);
+        } else {
+            gl.attachShader(program_id, id);
+        }
+    }
+    
+    gl.linkProgram(program_id);
+    if (!gl.getProgramParameter(program_id, gl.LINK_STATUS)) {
+        panic("shader link error:\n" + gl.getProgramInfoLog(program_id));
+    }
+    
+    return program_id;
+}
+
+var cubemap_loaded = false;
+var cubemap_texture_id = 0;
+
+function load_cubemap_face(gl, face, image) {
+    gl.texImage2D(face, 0, gl.RGB, 512, 512, 0, gl.RGB, gl.UNSIGNED_BYTE, image);    
+}
+
+function load_cubemap(gl) {
+    var id =  gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, id);
+    
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_LOD, 0);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAX_LOD, 8);
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_BASE_LEVEL, 0); 
+    gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAX_LEVEL, 8); 
+    
+    load_cubemap_face(gl, gl.TEXTURE_CUBE_MAP_NEGATIVE_X,
+        document.getElementById("left_skybox"));
+    load_cubemap_face(gl, gl.TEXTURE_CUBE_MAP_POSITIVE_X,
+        document.getElementById("right_skybox"));
+    load_cubemap_face(gl, gl.TEXTURE_CUBE_MAP_NEGATIVE_Y,
+        document.getElementById("bottom_skybox"));
+    load_cubemap_face(gl, gl.TEXTURE_CUBE_MAP_POSITIVE_Y, 
+        document.getElementById("top_skybox"));
+    load_cubemap_face(gl, gl.TEXTURE_CUBE_MAP_NEGATIVE_Z, 
+        document.getElementById("back_skybox"));
+    load_cubemap_face(gl, gl.TEXTURE_CUBE_MAP_POSITIVE_Z,
+        document.getElementById("front_skybox"));
+    
+    gl.generateMipmap(gl.TEXTURE_CUBE_MAP);
+    
+    return id;
+}
+/*  Part 3: Code for drawing beads.
+ *  
+ *  Each bead is drawn as a regular icosahedron. It's the lowest-poly  shape
+ *  I can think of for drawing roughly spherical objects. To reduce overhead
+ *  for drawing thousands of beads,  I'm  using  instanced  rendering.  Each
+ *  vertex  of  a  single  icosahedron has four attributes: its position and
+ *  normal in the coordinate system  of  a  single  icosahedron  (center  at
+ *  origin),  and  the  color  and  position  in space of the bead the drawn
+ *  icosahedron represents. The former 2 attributes  come  from  icosahedron
+ *  vertex  data  defined  in this file (bead vertices) filled in the vertex
+ *  buffer with id [vertex_buffer_id]; the latter  2  attributes  come  from
+ *  data  exported  from  the  physics  backend  of the program that will be
+ *  stored in the vertex buffer [instanced_buffer_id], and will  have  their
+ *  attribute  divisor  set  to  1  so  that the color and position in space
+ *  changes once per icosahedron, not once per icosahedron vertex.
+ */
+const vertex_position_index = 0;
+const vertex_normal_index = 1;
+const instance_position_index = 1;
+const instance_color_index = 2;
+
+const bead_vs_source = `#version 300 es
+precision mediump float;
+layout(location=0) in vec3 vertex_position;
+layout(location=1) in vec3 instance_position;
+layout(location=2) in vec3 instance_color;
+out vec3 material_color;
+out vec4 varying_normal;
+uniform mat4 view_matrix;
+uniform mat4 proj_matrix;
+void main() {
+    mat4 VP = proj_matrix * view_matrix;
+    gl_Position = VP * vec4(vertex_position + instance_position, 1.0);
+    material_color = instance_color;
+    varying_normal = view_matrix * vec4(vertex_position, 0.0);
+}`;
+// The vertex normal is the same as its position for spherical objects.
+
+const bead_fs_source = `#version 300 es
+precision mediump float;
+in vec3 material_color;
+in vec4 varying_normal;
+out vec4 pixel_color;
+void main() {
+    float z = normalize(varying_normal.xyz).z;
+    pixel_color = vec4(material_color * sqrt(z*.8 + .2), 1.0);
+}`;
+
+// Each bead will be a sphere approximated by a regular icosahedron.
+const bead = {};
+bead.vertex_count = 12;
+bead.element_count = 60;
+bead.scale = 5e-3;
+bead.phi = 1.618034;
+
+bead.vertices = Float32Array.of(
+     bead.phi*bead.scale,  bead.scale, 0,
+    -bead.phi*bead.scale,  bead.scale, 0,
+    -bead.phi*bead.scale, -bead.scale, 0,
+     bead.phi*bead.scale, -bead.scale, 0,
+     
+     bead.scale, 0,  bead.phi*bead.scale,
+    -bead.scale, 0,  bead.phi*bead.scale,
+    -bead.scale, 0, -bead.phi*bead.scale,
+     bead.scale, 0, -bead.phi*bead.scale,
+     
+     0,  bead.phi*bead.scale,  bead.scale,
+     0, -bead.phi*bead.scale,  bead.scale,
+     0, -bead.phi*bead.scale, -bead.scale,
+     0,  bead.phi*bead.scale, -bead.scale,
+);
+
+bead.elements = Uint16Array.of(
+    5, 4, 8,
+    5, 8, 1,
+    5, 1, 2,
+    5, 2, 9,
+    5, 9, 4,
+    
+    7, 6, 11,
+    7, 11, 0,
+    7, 0, 3,
+    7, 3, 10,
+    7, 10, 6,
+    
+    2, 1, 6,
+    6, 1, 11,
+    1, 8, 11,
+    11, 8, 0,
+    8, 4, 0,
+    0, 4, 3,
+    4, 9, 3,
+    3, 9, 10,
+    9, 2, 10,
+    10, 2, 6,
+);
+
+function draw_beads(gl) {
+    bead.vertex_stride = _get_bead_vertex_stride();
+    
+    if (!beads_drawn) return;
+    
+    if (bead.vao === undefined) {
+        bead.program_id = make_program(gl, bead_vs_source, bead_fs_source);
+        bead.view_matrix_id = gl.getUniformLocation(program_id, "view_matrix");
+        bead.proj_matrix_id = gl.getUniformLocation(program_id, "proj_matrix");
+        bead.vao = gl.createVertexArray();
+        gl.bindVertexArray(bead.vao);
+        
+        bead.vertex_buffer_id = gl.createBuffer();
+        bead.element_buffer_id = gl.createBuffer();
+        bead.instance_buffer_id = gl.createBuffer();
+        
+        gl.bindBuffer(gl.ARRAY_BUFFER, bead.vertex_buffer_id);
+        gl.bufferData(gl.ARRAY_BUFFER, bead.vertices, gl.STATIC_DRAW);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bead.element_buffer_id);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, bead.elements, gl.STATIC_DRAW);
+        
+        gl.vertexAttribPointer(
+            vertex_position_index,
+            3,
+            gl.FLOAT,
+            false,
+            3 * 4, // 3 * sizeof(float)
+            0
+        );
+        
+        gl.bindBuffer(gl.ARRAY_BUFFER, bead.instance_buffer_id);
+        gl.vertexAttribPointer(
+            instance_position_index,
+            3,
+            gl.FLOAT,
+            false,
+            bead.vertex_stride,
+            0
+        );
+        gl.vertexAttribPointer(
+            instance_color_index,
+            3,
+            gl.FLOAT,
+            false,
+            bead.vertex_stride,
+            _get_bead_color_offset()
+        );
+        gl.vertexAttribDivisor(instance_position_index, 1);
+        gl.vertexAttribDivisor(instance_color_index, 1);
+        
+        gl.enableVertexAttribArray(vertex_position_index);
+        gl.enableVertexAttribArray(instance_position_index);
+        gl.enableVertexAttribArray(instance_color_index);
+    }
+    
+    gl.useProgram(program_id);
+    
+    gl.uniformMatrix4fv(bead.view_matrix_id, false, _1D(view));
+    gl.uniformMatrix4fv(bead.proj_matrix_id, false, _1D(projection));
+    
+    gl.bindVertexArray(bead.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, bead.instance_buffer_id);
+    
+    const bead_count = bead_debug ? _get_debug_bead_count() : _get_bead_count();
+    const bead_ptr =  bead_debug ? _update_debug_bead_vertices() : _update_bead_vertices();
+    
+    gl.bufferData(
+        gl.ARRAY_BUFFER,
+        HEAPU8.slice(bead_ptr, bead_ptr + bead.vertex_stride * bead_count).buffer,
+        gl.DYNAMIC_DRAW
+    );
+    gl.drawElementsInstanced(
+        gl.TRIANGLES,
+        bead.element_count,
+        gl.UNSIGNED_SHORT,
+        0,
+        bead_count
+    );
+}
+
+/*  Part 4: Drawing a skybox.
+ *  
+ *  Not really that sophisticated code, just verbose. All we have to  do  is
+ *  draw  a big cube (40x40x40) around the camera and map the skybox cubemap
+ *  to it. To keep the skybox around the camera we make the  w-component  of
+ *  "position"  0 instead of 1 when we multiply it by the view matrix in the
+ *  vertex shader.
+ */
+
+const skybox_vs_source = `#version 300 es
+precision mediump float;
+layout(location=0) in vec3 position;
+out vec3 texture_coordinate;
+uniform mat4 view_matrix;
+uniform mat4 proj_matrix;
+void main() {
+    vec4 v = view_matrix * vec4(20.0*position, 0.0);
+    v = proj_matrix * vec4(v.xyz, 1);
+    gl_Position = vec4(v.x, v.y, 0, v.w);
+    texture_coordinate = position;
+}`;
+
+const skybox_fs_source = `#version 300 es
+precision mediump float;
+in vec3 texture_coordinate;
+out vec4 color;
+uniform samplerCube cubemap;
+void main() {
+    vec4 c = texture(cubemap, texture_coordinate);
+    c.a = 1.0;
+    color = c;
+}`;
+
+const skybox = {};
+
+skybox.vertices = Float32Array.of(
+    -1, 1, 1,
+    -1, -1, 1,
+    1, -1, 1,
+    1, 1, 1,
+    -1, 1, -1,
+    -1, -1, -1,
+    1, -1, -1,
+    1, 1, -1,
+);
+
+skybox.elements = Uint16Array.of(
+    7, 4, 5, 7, 5, 6,
+    1, 0, 3, 1, 3, 2,
+    5, 1, 2, 5, 2, 6,
+    4, 7, 3, 4, 3, 0,
+    0, 1, 5, 0, 5, 4,
+    2, 3, 7, 2, 7, 6
+);
+
+function draw_skybox(gl) {
+    if (!cubemap_loaded) {
+        cubemap_texture_id = load_cubemap(gl);
+        cubemap_loaded = true;
+    }
+    
+    if (skybox.vao === undefined) {
+        // It's 5:40 and I suddenly don't care about 80 char limits anymore.
+        // I'm more concerned about this annoying bubble in the nail polish
+        // on my left middle fingernail. Why did that happen? Oh right I
+        // painted them at 2 am while working on the project what did I expect.
+        skybox.program_id = make_program(gl, skybox_vs_source, skybox_fs_source);
+        skybox.view_matrix_id = gl.getUniformLocation(skybox.program_id, "view_matrix");
+        skybox.proj_matrix_id = gl.getUniformLocation(skybox.program_id, "proj_matrix");
+        skybox.cubemap_uniform_id = gl.getUniformLocation(skybox.program_id, "cubemap");
+        
+        skybox.vao = gl.createVertexArray();
+        gl.bindVertexArray(skybox.vao);
+        
+        const vertex_buffer_id = gl.createBuffer();
+        const element_buffer_id = gl.createBuffer();
+        
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, element_buffer_id);
+        gl.bufferData(
+            gl.ELEMENT_ARRAY_BUFFER, skybox.elements, gl.STATIC_DRAW
+        );
+        
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertex_buffer_id);
+        gl.bufferData(
+            gl.ARRAY_BUFFER, skybox.vertices, gl.STATIC_DRAW
+        ); 
+        gl.vertexAttribPointer(
+            0,
+            3,
+            gl.FLOAT,
+            false,
+            3 * 4, // 3 * sizeof(float)
+            0
+        );
+        gl.enableVertexAttribArray(0);
+    }
+    gl.useProgram(skybox.program_id);
+    
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, cubemap_texture_id);
+    gl.uniform1i(skybox.cubemap_uniform_id, 0);
+    
+    gl.uniformMatrix4fv(skybox.view_matrix_id, false, _1D(view));
+    gl.uniformMatrix4fv(skybox.proj_matrix_id, false, _1D(projection));
+    
+    gl.bindVertexArray(skybox.vao);
+    gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0);
+}
+
+/*  Part 5: Drawing the jello cube, which reflects and refracts  the  skybox
+ *  texture.  This  is  called twice per frame (at time of writing); once to
+ *  draw the interior faces (back face) of the cube and  once  to  draw  the
+ *  exterior  front  faces.  The glCullFace state determines this function's
+ *  behavior. It may have been more efficient to write 2 separate  functions
+ *  and shaders but I didn't.
+ *  
+ *  There's a lot going on in this code. The basic idea  is  that  we  first
+ *  depend  on  the  physics  backend  to  give us data each frame about the
+ *  triangles on the 6 surfaces of the jello cube: one position  and  normal
+ *  for  each  node  on the surface, with that data stored in an interleaved
+ *  array. Then, in the shader, for each vertex we use that normal  and  the
+ *  eye  position  to  calculate  two  vectors:  a  reflection  vector and a
+ *  refraction vector, which are later used as texture  coordinates  in  the
+ *  fragment  shader. To help make edges and geometry pop out a bit more, we
+ *  also calculate an "ambient" light component, whose brightness  increases
+ *  the closer the normal is to pointing directly at the camera.
+ *  
+ *  In the fragment shader, we add up the light from  the  texture  (fetched
+ *  using  the  vectors from earlier), the ambient light, and light from the
+ *  laser to get the  fragment  color.  This  laser  color  depends  on  how
+ *  directly  the  laser  is  shining  on this particular fragment. If we're
+ *  rendering a backface, the laser color  is  ignored  and  we  sample  the
+ *  texture   using   the   refraction   vector  and  an  intentionally  low
+ *  level-of-detail to make the refraction look blurry. As  there's  nothing
+ *  but sky behind the cube, the fragment is opaque (alpha=1); it only looks
+ *  transparent from having sampled from the same skybox texture.  If  we're
+ *  rendering  a  front  face,  we  include the laser color and the texel(s)
+ *  sampled using the reflection vector, and make the  fragment  transparent
+ *  so that the beads within the cube are still shown.
+ */
+const cube_vs_source = `#version 300 es
+precision mediump float;
+layout(location=0) in vec3 vertex_position;
+layout(location=1) in vec3 vertex_normal;
+out vec3 reflected_vector;
+out vec3 refracted_vector;
+out vec3 front_ambient;
+out vec3 back_ambient;
+out vec3 varying_position;
+uniform vec3 eye;
+uniform mat4 view_matrix;
+uniform mat4 proj_matrix;
+void main() {
+    vec3 n = normalize(vertex_normal);
+    mat4 VP = proj_matrix * view_matrix;
+    gl_Position = VP * vec4(vertex_position, 1.0);
+    vec3 eye_vertex = vertex_position - eye;
+    // This refracted vector is fake af because I ran out of physics mana at 1 am.
+    refracted_vector = eye_vertex - 0.175*dot(eye_vertex, n) * n;
+    reflected_vector = eye_vertex - 2.0*dot(eye_vertex, n) * n;
+    float z = abs(normalize(view_matrix * vec4(vertex_normal, 0.0))).z;
+    float ambient = sqrt(z * 0.6 + 0.4);
+    back_ambient = ambient * vec3(0.06, 0.06, 0.06);
+    front_ambient = ambient * vec3(0.15, 0.05, 0.10);
+    varying_position = vertex_position;
+}`;
+
+const cube_fs_source = `#version 300 es
+precision mediump float;
+in vec3 reflected_vector;
+in vec3 refracted_vector;
+in vec3 front_ambient;
+in vec3 back_ambient;
+in vec3 varying_position;
+out vec4 color;
+uniform samplerCube cubemap;
+uniform vec3 eye;
+uniform vec3 laser_direction;
+uniform vec4 laser_color;
+uniform float laser_radius;
+void main() {
+    vec4 front_texel = texture(cubemap, reflected_vector);
+    vec4 back_texel = textureLod(cubemap, refracted_vector, 2.5);
+    vec4 front_color = vec4(front_texel.rgb + front_ambient, 0.4);
+    vec4 back_color = vec4(back_texel.rgb * 0.5 + back_ambient, 1.0);
+    
+    vec3 v = normalize(laser_direction);
+    vec3 displacement = varying_position - eye;
+    vec3 beam_projection = dot(displacement, v) * v;
+    vec3 perpendicular = displacement - beam_projection;
+    float r = laser_radius, ss = dot(perpendicular, perpendicular);
+    float brightness = clamp(1.5*r*r - ss, 0.0, 1.0);
+    vec4 laser = laser_color * brightness;
+    color = (gl_FrontFacing ? front_color + laser : back_color);
+}`;
+
+const cube = {};
+
+function draw_cube(gl) {
+    if (!cubemap_loaded) {
+        cubemap_texture_id = load_cubemap(gl);
+        cubemap_loaded = true;
+    }
+    
+    if (cube.vao === undefined) {
+        cube.vertex_count = _get_cube_vertex_count();
+        cube.stride = _get_cube_vertex_stride();
+        cube.element_count = _get_cube_element_count();
+        
+        cube.program_id = make_program(gl, cube_vs_source, cube_fs_source);
+        
+        cube.view_matrix_id = gl.getUniformLocation(cube.program_id, "view_matrix");
+        cube.proj_matrix_id = gl.getUniformLocation(cube.program_id, "proj_matrix");
+        cube.eye_id = gl.getUniformLocation(cube.program_id, "eye");
+        cube.cubemap_uniform_id = gl.getUniformLocation(cube.program_id, "cubemap");
+        
+        cube.direction_id = gl.getUniformLocation(cube.program_id, "laser_direction");
+        cube.color_id = gl.getUniformLocation(cube.program_id, "laser_color");
+        cube.radius_id = gl.getUniformLocation(cube.program_id, "laser_radius");
+        
+        cube.vao = gl.createVertexArray();
+        cube.vertex_buffer_id = gl.createBuffer();
+        cube.element_buffer_id = gl.createBuffer();
+        
+        gl.bindVertexArray(cube.vao);
+        
+        const element_ptr = _get_cube_elements();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cube.element_buffer_id);
+        gl.bufferData(
+            gl.ELEMENT_ARRAY_BUFFER,
+            HEAPU8.slice(element_ptr, element_ptr + 2*cube.element_count),
+            gl.STATIC_DRAW
+        );
+        
+        gl.bindBuffer(gl.ARRAY_BUFFER, cube.vertex_buffer_id);
+        
+        gl.vertexAttribPointer(
+            vertex_position_index,
+            3,
+            gl.FLOAT,
+            false,
+            cube.stride,
+            0
+        );
+        gl.vertexAttribPointer(
+            vertex_normal_index,
+            3,
+            gl.FLOAT,
+            false,
+            cube.stride,
+            _get_cube_normal_offset()
+        );
+        gl.enableVertexAttribArray(vertex_position_index);
+        gl.enableVertexAttribArray(vertex_normal_index);
+    }
+    gl.useProgram(cube.program_id);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, cubemap_texture_id);
+    gl.uniform1i(cube.cubemap_uniform_id, 0);
+    
+    gl.uniformMatrix4fv(cube.view_matrix_id, false, _1D(view));
+    gl.uniformMatrix4fv(cube.proj_matrix_id, false, _1D(projection));
+    gl.uniform3fv(cube.eye_id, eye);
+    
+    gl.uniform3f(cube.direction_id, laser_direction[0], laser_direction[1], laser_direction[2]);
+    gl.uniform4fv(cube.color_id,
+        Float32Array.of(0, laser_on ? 1.0 : 0.0, 0, laser_on ? 0.6 : 0.0)
+    );
+    gl.uniform1f(cube.radius_id, laser_beam_radius);
+    
+    gl.bindVertexArray(cube.vao);
+    
+    const ptr = _update_cube_vertices();
+    
+    gl.bindBuffer(gl.ARRAY_BUFFER, cube.vertex_buffer_id);
+    gl.bufferData(
+        gl.ARRAY_BUFFER,
+        HEAPU8.slice(ptr, ptr + cube.stride*cube.vertex_count).buffer,
+        gl.DYNAMIC_DRAW
+    );
+    
+    gl.drawElements(gl.TRIANGLES, cube.element_count, gl.UNSIGNED_SHORT, 0);
+}
+
+/*  Part 6: Interface and main loop.
+ */
+function initialize_beads_and_cube() {
+    _reset_cube();
+    
+    const bead_list = generate_face_bead_list();
+    
+    for (var bead of bead_list) {
+        const err = _add_bead(
+            bead[0][0], bead[0][1], bead[0][2],
+            bead[1][0], bead[1][1], bead[1][2]
+        );
+        if (err != 0) {
+            console.warn("_add_bead error " + err);
+        }
+    }
+}
+
+function clamp_float(x, low, high) {
+    return Math.min(Math.max(x, low), high);
+}
+
+var orbit_mode = true;
+var dvorak = false;
+var w_held = false, a_held = false, s_held = false, d_held = false;
+var q_held = false, e_held = false, space_held = false;
+var theta = 1.5707, phi = 1.8, radius = 2.0, mouse_x = 0, mouse_y = 0;
+var jolt_commanded = false;
+
+const dvorak_table = {
+    192:192,        // grave accent
+    188:87,67:87,   // W
+    65:65, 72:65,   // A
+    79:83, 84:83,   // S
+    69:68, 78:68,   // D
+    222:81,71:81,   // Q
+    190:69,82:69,   // E
+    32:32,          // space
+    81:88, 87:88,   // X
+    85:70, 68:70,   // F
+    80:82,          // R
+    9:9,   13:13,   // Tab/return
+}
+
+function on_key_down(e) {
+    if (e.ctrlKey) {
+        return;
+    } else {
+        e.preventDefault();
+        const keyCode = dvorak ? dvorak_table[e.which] : e.which;
+        switch (keyCode) {
+          default:
+          break; case 192: dvorak = !dvorak;
+          break; case 87: case 73: w_held = true;
+          break; case 65: case 74:  a_held = true;
+          break; case 83: case 75: s_held = true;
+          break; case 68: case 76: d_held = true;
+          break; case 81: case 85: q_held = true;
+          break; case 69: case 79: e_held = true;
+          break; case 32: space_held = true;
+          
+          break; case 88: case 44:
+            orbit_mode = !orbit_mode;
+          break; case 70: case 72:
+            if (e.shiftKey) {
+                bead_debug = true;
+                beads_drawn = true;
+            } else {
+                beads_drawn = !beads_drawn;
+                bead_debug = false;
+            }
+          break; case 82:
+            if (e.shiftKey) initialize_beads_and_cube();
+          break; case 9: case 13:
+            jolt_commanded = true;
+        }
+    }
+}
+
+function on_key_up(e) {
+    const keyCode = dvorak ? dvorak_table[e.which] : e.which;
+    switch (keyCode) {
+      default:
+      break; case 87: case 73: w_held = false;
+      break; case 65: case 74: a_held = false;
+      break; case 83: case 75: s_held = false;
+      break; case 68: case 76: d_held = false;
+      break; case 81: case 85: q_held = false;
+      break; case 69: case 79: e_held = false;
+      break; case 32: space_held = false;
+    }
+}
+
+function record_mouse_position(e) {
+    e.preventDefault();
+    var rect = canvas.getBoundingClientRect();
+    mouse_x = e.clientX - rect.left;
+    mouse_y = e.clientY - rect.top;
+    // https://stackoverflow.com/questions/17130395/real-mouse-position-in-canvas
+}
+
+function on_mouse_down(e) {
+    laser_on = true;
+    record_mouse_position(e);
+}
+
+function on_mouse_up(e) {
+    laser_on = false;
+    record_mouse_position(e);
+}
+
+function look_at(eye, center, up) {
+    var f = center.minus(eye).normalized();
+    var s = f.cross(up).normalized();
+    var u = s.cross(f);
+    
+    return Mat.of([ s[0],  s[1],  s[2], -s.dot(eye)],
+                  [ u[0],  u[1],  u[2], -u.dot(eye)],
+                  [-f[0], -f[1], -f[2],  f.dot(eye)],
+                  [ 0,     0,     0,     1         ]);
+}
+
+function handle_controls() {    
+    forward_normal_vector = Vec.of(
+        Math.sin(phi) * Math.cos(theta),
+        Math.cos(phi),
+        Math.sin(phi) * Math.sin(theta)
+    );
+    
+    if (orbit_mode) {
+        theta += (a_held ? 4e-2 : 0) - (d_held ? 4e-2 : 0);
+        phi += (e_held ? 3e-2 : 0) - (q_held ? 3e-2 : 0);
+        radius += (s_held ? 5e-2 : 0) - (w_held ? 5e-2 : 0);
+        radius = clamp_float(radius, 1.25, 6.0);
+        
+        const center_ptr = _get_camera_center();
+        const center = Vec.of(
+            HEAPF32[(center_ptr >> 2) + 0],
+            HEAPF32[(center_ptr >> 2) + 1],
+            HEAPF32[(center_ptr >> 2) + 2]
+        );
+        
+        eye = center.minus(forward_normal_vector.times(radius));
+        
+        view = look_at(eye, center, Vec.of(0, 1, 0));
+    } else {
+        // Free-camera mode.
+        const right_vector = forward_normal_vector.cross(Vec.of(0, 1, 0));
+        right_vector.normalize();
+        const up_vector = right_vector.cross(forward_normal_vector);
+        
+        eye = eye.plus(right_vector.times(5e-2 * ((d_held?1:0) - (a_held?1:0))));
+        eye = eye.plus(forward_normal_vector.times(5e-2 * ((w_held?1:0) - (s_held?1:0))));
+        eye = eye.plus(up_vector.times(5e-2 * ((e_held?1:0) - (q_held?1:0))));
+        
+        if (space_held) {
+            theta += 1e-4 * (mouse_x - screen_x*0.5);
+            phi +=   1e-4 * (mouse_y - screen_y*0.5);
+        }
+        
+        view = look_at(eye, eye.plus(forward_normal_vector), Vec.of(0,1,0));
+    }
+    
+    phi = clamp_float(phi, 0.01, 3.13);
+    projection = Mat4.perspective(
+        fovy_radians,
+        screen_x/screen_y,
+        near_plane,
+        far_plane
+    );
+    
+    var y_plane_radius = Math.tan(fovy_radians / 2.0);
+    var x_plane_radius = y_plane_radius * screen_x / screen_y;
+    var mouse_vcs_x = x_plane_radius * (2.0 * mouse_x / screen_x - 1.0);
+    var mouse_vcs_y = y_plane_radius * (1.0 - 2.0 * mouse_y / screen_y);
+    var mouse_vcs = Vec.of(mouse_vcs_x, mouse_vcs_y, -1.0, 1.0);
+    var mouse_wcs = Mat4.inverse(view).times(mouse_vcs);
+    laser_direction = mouse_wcs.minus(Vec.of(eye[0], eye[1], eye[2], 1));
+    
+    _set_lamp(
+        0,
+        eye[0], eye[1], eye[2],
+        laser_direction[0], laser_direction[1], laser_direction[2],
+        laser_on ? laser_heat_per_second : 0.0,
+        laser_beam_radius
+    );
+    
+    if (jolt_commanded) {
+        jolt_commanded = false;
+        _jolt(0.6 * Math.cos(theta), 4.5, 0.6 * Math.sin(theta));
+    }
+}
+
+var gl_global;
+
+function main() {
+    canvas = document.getElementById("my_canvas");
+    fps_canvas = document.getElementById("fps_canvas");
+    fps_canvas_context = fps_canvas.getContext("2d");
+    fps_canvas_context.font = "40px helvetica";
+    const gl = gl_global = canvas.getContext("webgl2", { alpha:false });
+    if (!gl) {
+        panic("No WebGL 2 for you!");
+    }
+    
+    screen_x = gl.viewportWidth = canvas.width;
+    screen_y = gl.viewportHeight = canvas.height;
+    
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.enable(gl.CULL_FACE);
+    gl.clearColor(0, 0, 0, 1);
+    
+    initialize_beads_and_cube();
+    
+    document.onkeydown = on_key_down;
+    document.onkeyup = on_key_up;
+    document.onmousedown = on_mouse_down;
+    document.onmouseup = on_mouse_up;
+    document.onmousemove = record_mouse_position;
+    
+    requestAnimationFrame(draw_frame);
+}
+
+var last_fps_print_time = 0;
+var last_physics_update = 0;
+var frames = 0;
+
+function draw_frame(ms) {   // ms = milliseconds elapsed
+    const gl = gl_global;
+    
+    // Update physics 250 times per second (in 50 batches of 5 updates).
+    if (ms >= last_physics_update + 20) {
+        for (var i = 0; i < 5; ++i) _tick(0.004);
+        last_physics_update += 20;
+        if (last_physics_update + 20 < ms) {
+            last_physics_update = ms;
+        }
+    }
+    
+    // Show FPS twice per second.
+    ++frames;
+    if (ms >= last_fps_print_time + 500) {
+        fps_canvas_context.clearRect(0, 0, fps_canvas.width, fps_canvas.height);
+        fps_canvas_context.fillStyle = "rgb(0,0,0)";
+        fps_canvas_context.fillText((frames*2) + " FPS", 0, 50);
+        frames = 0;
+        last_fps_print_time += 500;
+        if (last_fps_print_time + 500 < ms) {
+            last_fps_print_time = ms;
+        }
+    }
+    
+    handle_controls();
+    
+    gl.viewport(0, 0, screen_x, screen_y);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    draw_skybox(gl);
+    
+    gl.cullFace(gl.FRONT);
+    draw_cube(gl);
+    gl.cullFace(gl.BACK);
+    
+    gl.clear(gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    draw_beads(gl);
+    gl.disable(gl.DEPTH_TEST);
+    
+    draw_cube(gl);
+    requestAnimationFrame(draw_frame);
+}
+
+</script>
+</head>
+
+<body onload="main();">
+    <h3>WebAssembly support required! Firefox 57 recommended for now.</h3>
+    <canvas id="my_canvas" style="border: none;" width="800" height="800"></canvas>
+    <canvas id="fps_canvas" style="border: none;" width="200" height="60"></canvas>
+    <br/>
+    <h2>Jelly McJelloFace</h2>
+    <h3>Controls</h3>
+    X/comma: Switch between orbit and free-camera.<br/>
+    WASDQE/IJKLUO: Move camera - (Orbit mode) ADQE to orbit, WS to zoom - (Free camera mode) WS forward/back, AD left/right, QE down/up.<br/>
+    Spacebar: Look around in free-camera mode.<br/>
+    Click-and-drag to use the laser.<br/>
+    Tab/enter: jolt the cube.<br/>
+    F/H: toggle bead visibility.<br/>
+    Shift+F/H: view debug beads.<br/>
+    Shift+R: Reset.<br/>
+    NOTE TO MY RIGHT-THINKING DVORAK HOMIES: Use grave-accent (`/~) to toggle dvorak controls.<br/>
+    
+<h3>Jelly McJelloFace Readme</h3>
+
+Dependencies: WebAssembly, WebGL 2, Garett's tinywebgl-ucla.js file for Web version. SDL2, GLM, OpenGL 3.3 for C++ version (SSE support and _mm-style intel intrinsics also a plus).
+<br/><br/>
+This program simulates a cube of jello with a face sculpture made of beads embedded inside. The player can jolt the cube and soften it using a laser. The beads inside move with the jello as it jiggles and deforms. The jello is made up of a 16x16x16 modified mass-spring system: the springs have their spring constant lowered as the laser shines on them, and there's an additional "pressure" force that fights to keep each sub-cube within the grid at a constant volume. This force doesn't get weakened by the laser and allows the cube to lose its shape as the laser weakens it without completely collapsing. Press shift+F to see the debug view for the grid mass-spring system.
+<br/><br/>
+Two versions of the program are provided: a Javascript/WebAssembly version and a compiled C++ offline version. The C++ version has better performance (including SIMD support) and extra niceness like resizability and scroll support. Note that both versions depend on the same jellymjf.c backend; the web version depends on the non-human-readable libjellymjf-wasm.js file (and friends) that are cross-compiled from the C backend. If you're grading this I advise that you just trust me when I say that I didn't plagiarize that file and it really did come from the C file, but if you insist, you can go through all seven levels of hell to get an experimental version of emcc working on your computer like I did, and you too can compile that file to WebAssembly yourself and verify that I didn't lie.
+<br/><br/>
+This almost certainly won't be an issue, but in case of a dispute, my statement is that my official submission is the C++ version of my project as compiled and run on a SEASnet computer (with minor configuration changes to run in a Visual Studio environment), not the web version. The web version is provided for easy distribution and should behave the same as the C++ version (besides the extra C++ features mentioned above), but in the end it's powered by experimental new technologies like WebGL 2 and WebAssembly while the C++ version is built on established technologies, and in case of calamity I can't stake my life on the web version.
+<br/><br/>
+Requirements met:
+<br/><br/>
+Hierarchical object: The face made of beads is generated using a hierarchy of coordinate systems. These functions are in beadface.h for the C++ version and the top of index.html for the web version. Hierarchies: world/head/hair/bleached tip; world/head/ear/earring; world/head/eye/white,iris,black loops of eye.
+<br/><br/>
+Camera tracking: The camera in the default orbit mode tracks the center of the jello cube (averaged over time to keep you from getting too sick). Jolt the cube with tab and press shift+F to enter the debug view to make this easier to see: there are four beads that show the origin (white) and axes (red green blue) for the world coordinate system, and these will move to one side as the camera follows the cube around in the world.
+<br/><br/>
+Custom object and texturing: The cube is my custom object. The positions and normals are recalculated each tick in jellymjf.c, while the texture coordinates are calculated per-vertex in the cube vertex shader to produce reflective and refractive effects. Additional simpler objects include the textured skybox and the icosahedron beads.
+<br/><br/>
+Real-time speed: At most 250 ticks are run per second in the program. The main function in the C++ version and the draw_frame function in the web version include a check against last_physics_update to enforce this speed limit.
+<br/><br/>
+FPS display: In the web version, a separate canvas is included that displays the FPS of the main canvas twice a second. The C++ version just prints the FPS to the console.
+<br/><br/>
+Creativity and complexity: This program is pretty darn quirky and complicated if you ask me.
+
+    <br/><br/>
+    sor_sea skybox provided by <a href="http://www.custommapmakers.org/skyboxes.php">http://www.custommapmakers.org/skyboxes.php</a>
+    <br/>
+    <img id="front_skybox" src="./JellyMcJelloFaceTex/front.bmp">   <!--Up-->
+    <img id="back_skybox" src="./JellyMcJelloFaceTex/back.bmp">     <!--Down-->
+    <img id="right_skybox" src="./JellyMcJelloFaceTex/right.bmp">   <!--Strange-->
+    <img id="left_skybox" src="./JellyMcJelloFaceTex/left.bmp">     <!--Charm-->
+    <img id="top_skybox" src="./JellyMcJelloFaceTex/top.bmp">       <!--Top-->
+    <img id="bottom_skybox" src="./JellyMcJelloFaceTex/bottom.bmp"> <!--Bottom-->
+</body>
+</html>
