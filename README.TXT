@@ -2,6 +2,8 @@ Play the game here!
 http://web.cs.ucla.edu/~dt/courses/CS174A/animations/assignment2-best-17f/AKELEY,DAVID/index.html
 https://goo.gl/vjJpjL
 
+NOTE: Due to a bug, you made need to perform a hard refresh (CTRL-SHIFT-R) to make the game work!
+
 Jelly McJelloFace Readme  -  David Akeley 2017-11-25
       
       Dependencies: WebAssembly, WebGL 2, Garett's
