@@ -758,7 +758,7 @@ static void initialize_beads_and_cube(void) {
     }
 }
 
-static bool handle_controls() {
+static bool handle_controls(float dt) {
     static bool orbit_mode = true;
     static bool w, a, s, d, q, e, space;
     static float theta = 1.5707f, phi = 1.8f, radius = 2.0f;
@@ -840,11 +840,11 @@ static bool handle_controls() {
     );
     
     if (orbit_mode) {
-        theta += (a * 4e-2) - (d * 4e-2);
-        phi += (e * 3e-2) - (q * 3e-2);
-        radius += (s * 5e-2) - (w * 5e-2);
+        theta += dt * 2.0f * (a-d);
+        phi += dt * 1.75f * (e-q);
+        radius += dt * 3.0f * (s-w);
         
-        radius = clamp_float(radius, 1.25, 6.0);
+        radius = clamp_float(radius, 1.25f, 6.0f);
         
         float const* center_ptr = get_camera_center();
         glm::vec3 center(center_ptr[0], center_ptr[1], center_ptr[2]);
@@ -858,13 +858,13 @@ static bool handle_controls() {
         right_vector = glm::normalize(right_vector);
         auto up_vector = glm::cross(right_vector, forward_normal_vector);
         
-        eye += 5e-2f * right_vector * (float)(d - a);
-        eye += 5e-2f * forward_normal_vector * (float)(w - s);
-        eye += 5e-2f * up_vector * (float)(e - q);
+        eye += dt * 3.0f * right_vector * (float)(d - a);
+        eye += dt * 3.0f * forward_normal_vector * (float)(w - s);
+        eye += dt * 3.0f * up_vector * (float)(e - q);
         
         if (space) {
-            theta += 1e-4 * (mouse_x - screen_x*0.5f);
-            phi +=   1e-4 * (mouse_y - screen_y*0.5f);
+            theta += 6.0f * dt / float(screen_x) * (mouse_x - screen_x*0.5f);
+            phi +=   6.0f * dt / float(screen_x) * (mouse_y - screen_y*0.5f);
         }
         
         view = glm::lookAt(eye, eye+forward_normal_vector, glm::vec3(0,1,0));
@@ -940,7 +940,12 @@ int main(int, char** argv) {
         }
         
         // Update the camera and draw the stuff.
-        no_quit = handle_controls();
+        static uint32_t previous_control_handle_ticks = 0;
+        uint32_t current_control_handle_ticks = SDL_GetTicks();
+        float dt = 0.001f * (current_control_handle_ticks
+                            - previous_control_handle_ticks);
+        previous_control_handle_ticks = current_control_handle_ticks;
+        no_quit = handle_controls(dt);
         gl.Viewport(0, 0, screen_x, screen_y);
         
         gl.Clear(GL_COLOR_BUFFER_BIT);
