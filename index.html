@@ -787,7 +787,9 @@ function on_key_down(e) {
     if (e.ctrlKey) {
         return;
     } else {
-        e.preventDefault();
+        e.preventDefault(); // NOTE FROM THE FUTURE: This is terrible! It prevents
+                            // all non-ctrl shortcuts including mouse back/fwd buttons!
+                            // Sorry mac users!
         const keyCode = dvorak ? dvorak_table[e.which] : e.which;
         switch (keyCode) {
           default:
