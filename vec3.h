@@ -86,17 +86,13 @@ static inline float magnitude(Vec3 a) {
     return _mm_cvtss_f32(_mm_and_ps(mask, _mm_mul_ss(SS, _mm_rsqrt_ss(SS))));
 }
 
-static inline Vec3 normalize(Vec3 a) {
-    __m128 SS = all_sum_squares(a);
-    __m128 mask = _mm_cmpgt_ps(SS, _mm_setzero_ps());
-    return (Vec3) { _mm_and_ps(mask, _mm_mul_ps(_mm_rsqrt_ps(SS), a.m)) };
-}
-
-static inline Vec3 normalize_magnitude(Vec3 a, float* magnitude) {
+static inline Vec3 normalize(Vec3 a, float* magnitude=nullptr) {
     __m128 SS = all_sum_squares(a);
     __m128 mask = _mm_cmpgt_ps(SS, _mm_setzero_ps());
     __m128 rsqrt = _mm_rsqrt_ps(SS);
-    *magnitude = _mm_cvtss_f32(_mm_and_ps(mask, _mm_mul_ss(SS, rsqrt)));
+    if (magnitude) {
+        *magnitude = _mm_cvtss_f32(_mm_and_ps(mask, _mm_mul_ss(SS, rsqrt)));
+    }
     return (Vec3) { _mm_and_ps(mask, _mm_mul_ps(rsqrt, a.m)) };
 }
 
@@ -107,7 +103,7 @@ static inline float step(float x, float control) {
 }
 
 // Return control >= 0 ? positive : negative
-static inline Vec3 step_vec3(Vec3 negative, Vec3 positive, float control) {
+static inline Vec3 step(Vec3 negative, Vec3 positive, float control) {
     __m128 positive_mask = _mm_cmpge_ps(_mm_set1_ps(control), _mm_setzero_ps());
     __m128 negative_mask = _mm_cmplt_ps(_mm_set1_ps(control), _mm_setzero_ps());
     return (Vec3) { _mm_or_ps(

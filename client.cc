@@ -917,13 +917,13 @@ int main(int, char** argv) {
     initialize_beads_and_cube();
     
     while (no_quit) {
-        // Update physics 250 times per second (in 50 batches of 5 updates).
+        // Update physics 125 times per second (in 125 batches of 1 updates).
         static uint32_t previous_update = 0;
         uint32_t current_ticks = SDL_GetTicks();
-        if (current_ticks >= previous_update + 20) {
-            for (int i = 0; i < 5; ++i) tick(0.004f);
-            previous_update += 20;
-            if (previous_update + 20 < current_ticks) {
+        if (current_ticks >= previous_update + 8) {
+            for (int i = 0; i < 1; ++i) tick(1/125.);
+            previous_update += 8;
+            if (previous_update + 8 < current_ticks) {
                 previous_update = current_ticks;
             }
         }
